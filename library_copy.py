@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Enumerate photos in a library folder, count by year, and copy to a destination.
+Enumerate photos in a macOS Photos Library, count by year, and copy to a destination
+using original filenames (not GUIDs).
 
 Usage:
     # Count only (dry run, no copying)
-    python3 photo_counter.py --dry-run
+    python3 library_copy.py --dry-run
 
     # Copy photos to destination organized by year
-    python3 photo_counter.py
+    python3 library_copy.py
 
     # Custom source and destination
-    python3 photo_counter.py --source /path/to/photos --destination /path/to/dest
+    python3 library_copy.py --source ~/Pictures/Photos\ Library.photoslibrary --destination /path/to/dest
 
 NOTE: To access the macOS Photos Library, Terminal (or your IDE) needs
 Full Disk Access: System Settings > Privacy & Security > Full Disk Access
@@ -20,6 +21,7 @@ import argparse
 import hashlib
 import os
 import shutil
+import sqlite3
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -37,12 +39,16 @@ VIDEO_EXTENSIONS = {
 ALL_MEDIA_EXTENSIONS = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
 
 DEFAULT_SOURCE = os.path.expanduser(
-    "~/Pictures/Photos Library.photoslibrary/originals"
+    "~/Pictures/Photos Library.photoslibrary"
 )
 DEFAULT_DESTINATION = "/Volumes/Karolina/FINAL PHOTOS"
 
+# Apple's Core Data epoch: 2001-01-01 00:00:00 UTC
+APPLE_EPOCH_OFFSET = 978307200
 
-def file_checksum(filepath: str) -> str:
+
+def file_checksum(filepath):
+    # type: (str) -> str
     """Compute MD5 checksum of a file."""
     h = hashlib.md5()
     with open(filepath, "rb") as f:
@@ -51,35 +57,130 @@ def file_checksum(filepath: str) -> str:
     return h.hexdigest()
 
 
-def find_media_files(library_path: str) -> List[Tuple[str, int]]:
-    """Walk the library and return list of (filepath, year) for all media files."""
-    files_found = []
-    skipped = 0
+def load_filename_map(library_path):
+    # type: (str) -> Dict[str, Tuple[str, Optional[int]]]
+    """
+    Query the Photos SQLite database to build a map of:
+        GUID filename (without extension) -> (original filename, year from EXIF/photo date)
 
-    for root, _dirs, files in os.walk(library_path):
+    The database stores the directory (GUID) and original filename for each asset.
+    """
+    db_path = os.path.join(library_path, "database", "Photos.sqlite")
+    if not os.path.exists(db_path):
+        print(f"Warning: Photos database not found at {db_path}")
+        print("         Will use GUID filenames as-is.")
+        return {}
+
+    filename_map = {}
+    try:
+        # Connect read-only to avoid any accidental modifications
+        conn = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True)
+        cursor = conn.cursor()
+
+        # ZASSET table contains: ZDIRECTORY (subfolder under originals/),
+        # ZORIGINALFILENAME (the real name), and ZDATECREATED (photo date)
+        cursor.execute("""
+            SELECT ZDIRECTORY, ZFILENAME, ZORIGINALFILENAME, ZDATECREATED
+            FROM ZASSET
+            WHERE ZDIRECTORY IS NOT NULL
+              AND ZFILENAME IS NOT NULL
+              AND ZORIGINALFILENAME IS NOT NULL
+        """)
+
+        for directory, guid_filename, original_filename, date_created in cursor.fetchall():
+            # Key: the GUID filename as stored on disk (e.g., "IMG_1234.HEIC" or a GUID)
+            # We key by directory/guid_filename to handle uniqueness
+            key = os.path.join(directory, guid_filename)
+
+            # Convert Apple Core Data timestamp to year
+            year = None
+            if date_created is not None:
+                try:
+                    timestamp = date_created + APPLE_EPOCH_OFFSET
+                    year = datetime.fromtimestamp(timestamp).year
+                except (OSError, ValueError, OverflowError):
+                    pass
+
+            filename_map[key] = (original_filename, year)
+
+        conn.close()
+        print(f"  Loaded {len(filename_map):,} filename mappings from Photos database")
+    except sqlite3.Error as e:
+        print(f"Warning: Could not read Photos database: {e}")
+        print("         Will use GUID filenames as-is.")
+
+    return filename_map
+
+
+def find_media_files(library_path, filename_map):
+    # type: (str, Dict[str, Tuple[str, Optional[int]]]) -> List[Tuple[str, str, int]]
+    """
+    Walk the library originals folder and return list of:
+        (source_filepath, destination_filename, year)
+
+    Uses the filename_map to resolve GUIDs to original names and get accurate years.
+    Falls back to the on-disk filename and file modification time if not in the map.
+    """
+    originals_path = os.path.join(library_path, "originals")
+    if not os.path.isdir(originals_path):
+        print(f"Error: originals folder not found at {originals_path}")
+        sys.exit(1)
+
+    files_found = []
+    matched = 0
+    unmatched = 0
+
+    for root, _dirs, files in os.walk(originals_path):
         for filename in files:
             ext = os.path.splitext(filename)[1].lower()
             if ext not in ALL_MEDIA_EXTENSIONS:
                 continue
 
             filepath = os.path.join(root, filename)
-            try:
-                mtime = os.path.getmtime(filepath)
-                year = datetime.fromtimestamp(mtime).year
-                files_found.append((filepath, year))
-            except OSError:
-                skipped += 1
 
-    if skipped:
-        print(f"  (skipped {skipped} files due to read errors)")
+            # Build the relative key: e.g., "A/ABC12345-1234-..../IMG_1234.HEIC"
+            rel_path = os.path.relpath(filepath, originals_path)
+            # The database stores directory as the subfolder (e.g., "A/ABC12345...")
+            # and filename separately, so the key is directory/filename
+            lookup_key = rel_path
+
+            if lookup_key in filename_map:
+                original_name, db_year = filename_map[lookup_key]
+                matched += 1
+
+                # Use year from database if available, otherwise fall back to mtime
+                if db_year is not None:
+                    year = db_year
+                else:
+                    try:
+                        mtime = os.path.getmtime(filepath)
+                        year = datetime.fromtimestamp(mtime).year
+                    except OSError:
+                        continue
+            else:
+                # Not in database — use filename and mtime as-is
+                original_name = filename
+                unmatched += 1
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    year = datetime.fromtimestamp(mtime).year
+                except OSError:
+                    continue
+
+            files_found.append((filepath, original_name, year))
+
+    print(f"  Matched to original names: {matched:,}")
+    if unmatched:
+        print(f"  Using GUID names (no DB match): {unmatched:,}")
 
     return files_found
 
 
-def print_counts(media_files: List[Tuple[str, int]]):
+def print_counts(media_files):
+    # type: (List[Tuple[str, str, int]]) -> None
     """Print photo/video counts bucketed by year."""
     counts = defaultdict(int)
-    for _, year in media_files:
+    for _, _, year in media_files:
         counts[year] += 1
 
     print("Photos/videos by year:")
@@ -90,7 +191,8 @@ def print_counts(media_files: List[Tuple[str, int]]):
     print(f"  Total: {sum(counts.values()):,}")
 
 
-def resolve_destination_path(dest_dir: str, filename: str, src_checksum: str) -> Optional[str]:
+def resolve_destination_path(dest_dir, filename, src_checksum):
+    # type: (str, str, str) -> Optional[str]
     """
     Determine the final destination path for a file.
 
@@ -111,7 +213,7 @@ def resolve_destination_path(dest_dir: str, filename: str, src_checksum: str) ->
     name, ext = os.path.splitext(filename)
     counter = 1
     while True:
-        new_filename = f"{name}_{counter}{ext}"
+        new_filename = "{}_{}{}".format(name, counter, ext)
         new_dest_path = os.path.join(dest_dir, new_filename)
         if not os.path.exists(new_dest_path):
             return new_dest_path
@@ -120,7 +222,8 @@ def resolve_destination_path(dest_dir: str, filename: str, src_checksum: str) ->
         counter += 1
 
 
-def copy_photos_by_year(media_files: List[Tuple[str, int]], destination: str, dry_run: bool, test: bool = False):
+def copy_photos_by_year(media_files, destination, dry_run, test=False):
+    # type: (List[Tuple[str, str, int]], str, bool, bool) -> None
     """Copy media files into per-year folders at the destination."""
     copied = 0
     skipped_identical = 0
@@ -129,32 +232,31 @@ def copy_photos_by_year(media_files: List[Tuple[str, int]], destination: str, dr
 
     total = len(media_files)
 
-    for i, (src_path, year) in enumerate(media_files, 1):
-        filename = os.path.basename(src_path)
+    for i, (src_path, dest_filename, year) in enumerate(media_files, 1):
         dest_dir = os.path.join(destination, str(year))
 
         if dry_run:
-            print(f"  [DRY RUN] {src_path} -> {dest_dir}/{filename}")
+            print("  [DRY RUN] {} -> {}/{}".format(src_path, dest_dir, dest_filename))
             copied += 1
             continue
 
         try:
             src_checksum = file_checksum(src_path)
         except OSError as e:
-            print(f"  [ERROR] Cannot read {src_path}: {e}")
+            print("  [ERROR] Cannot read {}: {}".format(src_path, e))
             skipped_error += 1
             continue
 
         os.makedirs(dest_dir, exist_ok=True)
 
-        final_path = resolve_destination_path(dest_dir, filename, src_checksum)
+        final_path = resolve_destination_path(dest_dir, dest_filename, src_checksum)
 
         if final_path is None:
             skipped_identical += 1
             continue
 
         final_filename = os.path.basename(final_path)
-        if final_filename != filename:
+        if final_filename != dest_filename:
             renamed += 1
 
         try:
@@ -162,48 +264,48 @@ def copy_photos_by_year(media_files: List[Tuple[str, int]], destination: str, dr
             # Verify copy integrity
             dest_checksum = file_checksum(final_path)
             if src_checksum != dest_checksum:
-                print(f"  [ERROR] Checksum mismatch after copy: {src_path}")
-                print(f"          Source: {src_checksum}  Dest: {dest_checksum}")
+                print("  [ERROR] Checksum mismatch after copy: {}".format(src_path))
+                print("          Source: {}  Dest: {}".format(src_checksum, dest_checksum))
                 os.remove(final_path)
                 skipped_error += 1
                 continue
             copied += 1
             if test:
-                print(f"  [TEST] Successfully copied 1 file: {src_path} -> {final_path}")
+                print("  [TEST] Successfully copied 1 file: {} -> {}".format(src_path, final_path))
                 break
             if i % 100 == 0 or i == total:
-                print(f"  Progress: {i:,}/{total:,} files processed...")
+                print("  Progress: {:,}/{:,} files processed...".format(i, total))
         except OSError as e:
-            print(f"  [ERROR] Failed to copy {src_path}: {e}")
+            print("  [ERROR] Failed to copy {}: {}".format(src_path, e))
             skipped_error += 1
 
     print()
     print("=" * 40)
     if dry_run:
-        print(f"DRY RUN complete: {copied:,} files would be copied")
-        print(f"Total files found: {total:,}")
+        print("DRY RUN complete: {:,} files would be copied".format(copied))
+        print("Total files found: {:,}".format(total))
     else:
-        print(f"Copied:              {copied:,}")
-        print(f"Renamed (dupes):     {renamed:,}")
-        print(f"Skipped (identical): {skipped_identical:,}")
+        print("Copied:              {:,}".format(copied))
+        print("Renamed (dupes):     {:,}".format(renamed))
+        print("Skipped (identical): {:,}".format(skipped_identical))
         if skipped_error:
-            print(f"Skipped (errors):    {skipped_error:,}")
-        print(f"Total files found:   {total:,}")
+            print("Skipped (errors):    {:,}".format(skipped_error))
+        print("Total files found:   {:,}".format(total))
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Count and copy photos from a library into per-year folders."
+        description="Count and copy photos from a macOS Photos Library into per-year folders, using original filenames."
     )
     parser.add_argument(
         "--source",
         default=DEFAULT_SOURCE,
-        help=f"Source photo library path (default: {DEFAULT_SOURCE})",
+        help="Source Photos Library path (default: {})".format(DEFAULT_SOURCE),
     )
     parser.add_argument(
         "--destination",
         default=DEFAULT_DESTINATION,
-        help=f"Destination root folder (default: {DEFAULT_DESTINATION})",
+        help="Destination root folder (default: {})".format(DEFAULT_DESTINATION),
     )
     parser.add_argument(
         "--dry-run",
@@ -221,35 +323,36 @@ def main():
     destination = os.path.expanduser(args.destination)
 
     if not os.path.isdir(source):
-        print(f"Error: Source '{source}' is not a directory or is not accessible.")
+        print("Error: Source '{}' is not a directory or is not accessible.".format(source))
         print()
         print("If using the macOS Photos Library, grant Full Disk Access to Terminal:")
         print("  System Settings > Privacy & Security > Full Disk Access > Terminal")
         sys.exit(1)
 
-    print(f"Source:      {source}")
-    print(f"Destination: {destination}")
+    print("Source:      {}".format(source))
+    print("Destination: {}".format(destination))
     mode = "TEST (1 file)" if args.test else ("DRY RUN" if args.dry_run else "COPY")
-    print(f"Mode:        {mode}")
+    print("Mode:        {}".format(mode))
+    print()
+
+    print("Loading Photos database...")
+    filename_map = load_filename_map(source)
     print()
 
     print("Scanning source...")
-    media_files = find_media_files(source)
-
-    if not media_files:
-        print("No media files found.")
-        sys.exit(0)
+    media_files = find_media_files(source, filename_map)
+    print()
 
     print_counts(media_files)
     print()
 
     if not args.dry_run and not args.test and not os.path.isdir(destination):
-        print(f"Error: Destination '{destination}' is not accessible.")
+        print("Error: Destination '{}' is not accessible.".format(destination))
         print("Make sure the NAS is mounted (Finder > Go > Connect to Server).")
         sys.exit(1)
 
     if args.test and not os.path.isdir(destination):
-        print(f"Error: Destination '{destination}' is not accessible.")
+        print("Error: Destination '{}' is not accessible.".format(destination))
         print("Make sure the NAS is mounted (Finder > Go > Connect to Server).")
         sys.exit(1)
 

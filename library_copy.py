@@ -16,8 +16,6 @@ NOTE: To access the macOS Photos Library, Terminal (or your IDE) needs
 Full Disk Access: System Settings > Privacy & Security > Full Disk Access
 """
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import os
@@ -25,6 +23,7 @@ import shutil
 import sys
 from collections import defaultdict
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 # Common photo/video extensions
 PHOTO_EXTENSIONS = {
@@ -52,7 +51,7 @@ def file_checksum(filepath: str) -> str:
     return h.hexdigest()
 
 
-def find_media_files(library_path: str) -> list[tuple[str, int]]:
+def find_media_files(library_path: str) -> List[Tuple[str, int]]:
     """Walk the library and return list of (filepath, year) for all media files."""
     files_found = []
     skipped = 0
@@ -77,9 +76,9 @@ def find_media_files(library_path: str) -> list[tuple[str, int]]:
     return files_found
 
 
-def print_counts(media_files: list[tuple[str, int]]):
+def print_counts(media_files: List[Tuple[str, int]]):
     """Print photo/video counts bucketed by year."""
-    counts: dict[int, int] = defaultdict(int)
+    counts = defaultdict(int)
     for _, year in media_files:
         counts[year] += 1
 
@@ -91,7 +90,7 @@ def print_counts(media_files: list[tuple[str, int]]):
     print(f"  Total: {sum(counts.values()):,}")
 
 
-def resolve_destination_path(dest_dir: str, filename: str, src_checksum: str) -> str | None:
+def resolve_destination_path(dest_dir: str, filename: str, src_checksum: str) -> Optional[str]:
     """
     Determine the final destination path for a file.
 
@@ -121,7 +120,7 @@ def resolve_destination_path(dest_dir: str, filename: str, src_checksum: str) ->
         counter += 1
 
 
-def copy_photos_by_year(media_files: list[tuple[str, int]], destination: str, dry_run: bool, test: bool = False):
+def copy_photos_by_year(media_files: List[Tuple[str, int]], destination: str, dry_run: bool, test: bool = False):
     """Copy media files into per-year folders at the destination."""
     copied = 0
     skipped_identical = 0

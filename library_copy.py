@@ -218,6 +218,7 @@ def find_media_files(library_path, filename_map):
         sys.exit(1)
 
     files_found = []
+    skipped_no_name = []
     matched = 0
     unmatched = 0
 
@@ -248,21 +249,21 @@ def find_media_files(library_path, filename_map):
                         year = datetime.fromtimestamp(mtime).year
                     except OSError:
                         continue
+
+                files_found.append((filepath, original_name, year))
             else:
-                # Not in database — use filename and mtime as-is
-                original_name = filename
+                # Not in database — skip (no original name available)
+                skipped_no_name.append(filepath)
                 unmatched += 1
-                try:
-                    mtime = os.path.getmtime(filepath)
-                    year = datetime.fromtimestamp(mtime).year
-                except OSError:
-                    continue
 
-            files_found.append((filepath, original_name, year))
-
-    print(f"  Matched to original names: {matched:,}")
+    print("  Matched to original names: {:,}".format(matched))
     if unmatched:
-        print(f"  Using GUID names (no DB match): {unmatched:,}")
+        print("  Skipped (no original name): {:,}".format(unmatched))
+        # Print first few skipped files for reference
+        for path in skipped_no_name[:5]:
+            print("    e.g. {}".format(os.path.basename(path)))
+        if len(skipped_no_name) > 5:
+            print("    ... and {:,} more".format(len(skipped_no_name) - 5))
 
     return files_found
 
@@ -449,19 +450,36 @@ def print_test_diagnostics(src_path, dest_filename, year, library_path):
 
 def copy_photos_by_year(media_files, destination, dry_run, test=False, library_path=None):
     # type: (List[Tuple[str, str, int]], str, bool, bool) -> None
-    """Copy media files into per-year folders at the destination."""
+    """Copy media files into per-year folders at the destination, then delete source."""
     copied = 0
+    deleted = 0
     skipped_identical = 0
     skipped_error = 0
     renamed = 0
 
     total = len(media_files)
+    last_percent_printed = -1
+
+    print()
+    if dry_run:
+        print("Analyzing {:,} files...".format(total))
+    elif test:
+        print("Running test copy (1 file)...")
+    else:
+        print("Copying {:,} files...".format(total))
+    print()
 
     for i, (src_path, dest_filename, year) in enumerate(media_files, 1):
         dest_dir = os.path.join(destination, str(year))
 
+        # Print percentage progress
+        if total > 0:
+            pct = (i * 100) // total
+            if pct > last_percent_printed:
+                last_percent_printed = pct
+                print("{}%".format(pct))
+
         if dry_run:
-            print("  [DRY RUN] {} -> {}/{}".format(src_path, dest_dir, dest_filename))
             copied += 1
             continue
 
@@ -495,13 +513,18 @@ def copy_photos_by_year(media_files, destination, dry_run, test=False, library_p
                 skipped_error += 1
                 continue
             copied += 1
+            # Delete source after verified copy (not in test mode)
+            if not test:
+                try:
+                    os.remove(src_path)
+                    deleted += 1
+                except OSError as e:
+                    print("  [WARNING] Copied OK but failed to delete source: {}".format(e))
             if test:
                 print("  [TEST] Successfully copied 1 file: {} -> {}".format(src_path, final_path))
                 if library_path:
                     print_test_diagnostics(src_path, dest_filename, year, library_path)
                 break
-            if i % 100 == 0 or i == total:
-                print("  Progress: {:,}/{:,} files processed...".format(i, total))
         except OSError as e:
             print("  [ERROR] Failed to copy {}: {}".format(src_path, e))
             skipped_error += 1
@@ -513,6 +536,7 @@ def copy_photos_by_year(media_files, destination, dry_run, test=False, library_p
         print("Total files found: {:,}".format(total))
     else:
         print("Copied:              {:,}".format(copied))
+        print("Source deleted:      {:,}".format(deleted))
         print("Renamed (dupes):     {:,}".format(renamed))
         print("Skipped (identical): {:,}".format(skipped_identical))
         if skipped_error:

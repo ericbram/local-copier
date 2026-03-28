@@ -58,42 +58,131 @@ def file_checksum(filepath):
     return h.hexdigest()
 
 
+def discover_db_schema(library_path):
+    # type: (str) -> None
+    """Print all tables and columns in the Photos database for debugging."""
+    db_path = os.path.join(library_path, "database", "Photos.sqlite")
+    if not os.path.exists(db_path):
+        print("  Photos database not found at {}".format(db_path))
+        return
+
+    try:
+        conn = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True)
+        cursor = conn.cursor()
+
+        # Get ZASSET columns
+        cursor.execute("PRAGMA table_info(ZASSET)")
+        columns = cursor.fetchall()
+        print("  ZASSET table has {} columns".format(len(columns)))
+
+        # Print columns that look relevant to filenames/names/dates
+        print("  Filename-related columns:")
+        for col in columns:
+            col_name = col[1]
+            if any(kw in col_name.upper() for kw in [
+                "FILE", "NAME", "ORIGINAL", "TITLE", "DIR", "PATH",
+                "DATE", "IMPORT", "UUID"
+            ]):
+                print("    {} (type: {})".format(col_name, col[2]))
+
+        # Also check for other asset-related tables
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        tables = [r[0] for r in cursor.fetchall()]
+        asset_tables = [t for t in tables if "ASSET" in t.upper() or "ADDITIONAL" in t.upper()]
+        if asset_tables:
+            print("  Other asset-related tables: {}".format(", ".join(asset_tables)))
+            for t in asset_tables:
+                if t != "ZASSET":
+                    cursor.execute("PRAGMA table_info({})".format(t))
+                    t_cols = cursor.fetchall()
+                    name_cols = [c[1] for c in t_cols if any(
+                        kw in c[1].upper() for kw in ["FILE", "NAME", "ORIGINAL", "TITLE"]
+                    )]
+                    if name_cols:
+                        print("    {}: {}".format(t, ", ".join(name_cols)))
+
+        conn.close()
+    except sqlite3.Error as e:
+        print("  [DB error during schema discovery: {}]".format(e))
+
+
 def load_filename_map(library_path):
     # type: (str) -> Dict[str, Tuple[str, Optional[int]]]
     """
     Query the Photos SQLite database to build a map of:
-        GUID filename (without extension) -> (original filename, year from EXIF/photo date)
+        disk path (relative to originals/) -> (original filename, year from photo date)
 
-    The database stores the directory (GUID) and original filename for each asset.
+    On macOS Sequoia (15.x), original filenames are in ZADDITIONALASSETATTRIBUTES
+    joined to ZASSET. On older versions they may be directly in ZASSET.
     """
     db_path = os.path.join(library_path, "database", "Photos.sqlite")
     if not os.path.exists(db_path):
-        print(f"Warning: Photos database not found at {db_path}")
+        print("Warning: Photos database not found at {}".format(db_path))
         print("         Will use GUID filenames as-is.")
         return {}
 
     filename_map = {}
     try:
-        # Connect read-only to avoid any accidental modifications
         conn = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True)
         cursor = conn.cursor()
 
-        # ZASSET table contains: ZDIRECTORY (subfolder under originals/),
-        # ZORIGINALFILENAME (the real name), and ZDATECREATED (photo date)
-        cursor.execute("""
-            SELECT ZDIRECTORY, ZFILENAME, ZORIGINALFILENAME, ZDATECREATED
-            FROM ZASSET
-            WHERE ZDIRECTORY IS NOT NULL
-              AND ZFILENAME IS NOT NULL
-              AND ZORIGINALFILENAME IS NOT NULL
-        """)
+        # Check which tables have the original filename
+        cursor.execute("PRAGMA table_info(ZASSET)")
+        asset_columns = {col[1] for col in cursor.fetchall()}
 
-        for directory, guid_filename, original_filename, date_created in cursor.fetchall():
-            # Key: the GUID filename as stored on disk (e.g., "IMG_1234.HEIC" or a GUID)
-            # We key by directory/guid_filename to handle uniqueness
+        cursor.execute("PRAGMA table_info(ZADDITIONALASSETATTRIBUTES)")
+        additional_columns = {col[1] for col in cursor.fetchall()}
+
+        # Determine where ZORIGINALFILENAME lives
+        original_in_additional = "ZORIGINALFILENAME" in additional_columns
+        original_in_asset = "ZORIGINALFILENAME" in asset_columns
+
+        # Find the best date column in ZASSET
+        date_col = None
+        for candidate in ["ZDATECREATED", "ZADDEDDATE", "ZMODIFICATIONDATE"]:
+            if candidate in asset_columns:
+                date_col = candidate
+                break
+
+        if original_in_additional:
+            # Sequoia (15.x) and newer: join ZASSET with ZADDITIONALASSETATTRIBUTES
+            print("  Schema: ZORIGINALFILENAME in ZADDITIONALASSETATTRIBUTES (Sequoia+)")
+            query = """
+                SELECT A.ZDIRECTORY, A.ZFILENAME, B.ZORIGINALFILENAME{}
+                FROM ZASSET A
+                INNER JOIN ZADDITIONALASSETATTRIBUTES B ON B.ZASSET = A.Z_PK
+                WHERE A.ZDIRECTORY IS NOT NULL
+                  AND A.ZFILENAME IS NOT NULL
+                  AND B.ZORIGINALFILENAME IS NOT NULL
+            """.format(", A.{}".format(date_col) if date_col else "")
+        elif original_in_asset:
+            # Older macOS: original filename directly in ZASSET
+            print("  Schema: ZORIGINALFILENAME in ZASSET (pre-Sequoia)")
+            query = """
+                SELECT ZDIRECTORY, ZFILENAME, ZORIGINALFILENAME{}
+                FROM ZASSET
+                WHERE ZDIRECTORY IS NOT NULL
+                  AND ZFILENAME IS NOT NULL
+                  AND ZORIGINALFILENAME IS NOT NULL
+            """.format(", {}".format(date_col) if date_col else "")
+        else:
+            print("Warning: ZORIGINALFILENAME not found in either ZASSET or ZADDITIONALASSETATTRIBUTES")
+            discover_db_schema(library_path)
+            conn.close()
+            return {}
+
+        print("  Date column: {}".format(date_col or "NONE (using file mtime)"))
+
+        cursor.execute(query)
+
+        for row in cursor.fetchall():
+            directory = row[0]
+            guid_filename = row[1]
+            original_filename = row[2]
+            date_created = row[3] if date_col else None
+
             key = os.path.join(directory, guid_filename)
 
-            # Convert Apple Core Data timestamp to year
             year = None
             if date_created is not None:
                 try:
@@ -105,10 +194,11 @@ def load_filename_map(library_path):
             filename_map[key] = (original_filename, year)
 
         conn.close()
-        print(f"  Loaded {len(filename_map):,} filename mappings from Photos database")
+        print("  Loaded {:,} filename mappings from Photos database".format(len(filename_map)))
     except sqlite3.Error as e:
-        print(f"Warning: Could not read Photos database: {e}")
+        print("Warning: Could not read Photos database: {}".format(e))
         print("         Will use GUID filenames as-is.")
+        discover_db_schema(library_path)
 
     return filename_map
 
@@ -305,29 +395,49 @@ def print_test_diagnostics(src_path, dest_filename, year, library_path):
 
             # Try a broader search by just filename
             cursor.execute("""
-                SELECT ZDIRECTORY, ZFILENAME, ZORIGINALFILENAME
-                FROM ZASSET
-                WHERE ZFILENAME = ?
+                SELECT * FROM ZASSET WHERE ZFILENAME = ?
             """, (disk_filename,))
             broader = cursor.fetchall()
             if broader:
-                print("  [Broader search by filename only found {} match(es):]".format(len(broader)))
+                print("  [Broader search by filename only found {} match(es)]".format(len(broader)))
                 for r in broader:
-                    print("    dir={}, file={}, original={}".format(r[0], r[1], r[2]))
+                    print("  --- Matched row (all non-null columns) ---")
+                    for key in r.keys():
+                        val = r[key]
+                        if val is not None:
+                            if "DATE" in key.upper() and isinstance(val, (int, float)):
+                                try:
+                                    ts = val + APPLE_EPOCH_OFFSET
+                                    human = datetime.fromtimestamp(ts)
+                                    print("    {}: {} ({})".format(key, val, human))
+                                except (OSError, ValueError, OverflowError):
+                                    print("    {}: {}".format(key, val))
+                            else:
+                                print("    {}: {}".format(key, val))
             else:
                 print("  [No match even by filename alone]")
 
                 # Try searching by directory
                 cursor.execute("""
-                    SELECT ZDIRECTORY, ZFILENAME, ZORIGINALFILENAME
-                    FROM ZASSET
-                    WHERE ZDIRECTORY = ?
+                    SELECT * FROM ZASSET WHERE ZDIRECTORY = ?
                 """, (directory,))
                 dir_matches = cursor.fetchall()
                 if dir_matches:
-                    print("  [Files in same directory in DB:]")
-                    for r in dir_matches:
-                        print("    dir={}, file={}, original={}".format(r[0], r[1], r[2]))
+                    print("  [Files in same directory in DB ({} matches):]".format(len(dir_matches)))
+                    for r in dir_matches[:3]:  # Show first 3
+                        print("  --- Row ---")
+                        for key in r.keys():
+                            val = r[key]
+                            if val is not None:
+                                if "DATE" in key.upper() and isinstance(val, (int, float)):
+                                    try:
+                                        ts = val + APPLE_EPOCH_OFFSET
+                                        human = datetime.fromtimestamp(ts)
+                                        print("    {}: {} ({})".format(key, val, human))
+                                    except (OSError, ValueError, OverflowError):
+                                        print("    {}: {}".format(key, val))
+                                else:
+                                    print("    {}: {}".format(key, val))
 
         conn.close()
     except sqlite3.Error as e:

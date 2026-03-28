@@ -22,6 +22,7 @@ import hashlib
 import os
 import shutil
 import sqlite3
+import stat
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -222,7 +223,121 @@ def resolve_destination_path(dest_dir, filename, src_checksum):
         counter += 1
 
 
-def copy_photos_by_year(media_files, destination, dry_run, test=False):
+def print_test_diagnostics(src_path, dest_filename, year, library_path):
+    # type: (str, str, int, str) -> None
+    """Print detailed diagnostics about a file for --test mode."""
+    print()
+    print("=" * 60)
+    print("FILE DIAGNOSTICS")
+    print("=" * 60)
+
+    # Filesystem info
+    print("\n--- Filesystem ---")
+    print("  Source path:      {}".format(src_path))
+    print("  On-disk filename: {}".format(os.path.basename(src_path)))
+    print("  Resolved name:    {}".format(dest_filename))
+    print("  Assigned year:    {}".format(year))
+    try:
+        st = os.stat(src_path)
+        print("  File size:        {:,} bytes".format(st.st_size))
+        print("  Created (ctime):  {}".format(datetime.fromtimestamp(st.st_ctime)))
+        print("  Modified (mtime): {}".format(datetime.fromtimestamp(st.st_mtime)))
+        print("  Accessed (atime): {}".format(datetime.fromtimestamp(st.st_atime)))
+        if hasattr(st, "st_birthtime"):
+            print("  Birth time:       {}".format(datetime.fromtimestamp(st.st_birthtime)))
+    except OSError as e:
+        print("  [ERROR reading stat: {}]".format(e))
+
+    # Database lookup
+    originals_path = os.path.join(library_path, "originals")
+    rel_path = os.path.relpath(src_path, originals_path)
+    parts = rel_path.split(os.sep)
+    # directory is everything except the last component (filename)
+    if len(parts) >= 2:
+        directory = os.path.join(*parts[:-1])
+        disk_filename = parts[-1]
+    else:
+        directory = ""
+        disk_filename = rel_path
+
+    print("\n--- Database Lookup ---")
+    print("  Relative path:  {}".format(rel_path))
+    print("  Directory key:   {}".format(directory))
+    print("  Filename key:    {}".format(disk_filename))
+
+    db_path = os.path.join(library_path, "database", "Photos.sqlite")
+    if not os.path.exists(db_path):
+        print("  [Photos database not found]")
+        return
+
+    try:
+        conn = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Get all columns for this asset
+        cursor.execute("""
+            SELECT * FROM ZASSET
+            WHERE ZDIRECTORY = ? AND ZFILENAME = ?
+        """, (directory, disk_filename))
+        row = cursor.fetchone()
+
+        if row:
+            print("  [MATCH FOUND in ZASSET]")
+            print()
+            print("  --- All ZASSET columns for this file ---")
+            for key in row.keys():
+                val = row[key]
+                if val is not None:
+                    # Convert Apple timestamps for readability
+                    if "DATE" in key.upper() and isinstance(val, (int, float)):
+                        try:
+                            ts = val + APPLE_EPOCH_OFFSET
+                            human = datetime.fromtimestamp(ts)
+                            print("    {}: {} ({})".format(key, val, human))
+                        except (OSError, ValueError, OverflowError):
+                            print("    {}: {}".format(key, val))
+                    else:
+                        print("    {}: {}".format(key, val))
+        else:
+            print("  [NO MATCH in ZASSET for directory='{}', filename='{}']".format(
+                directory, disk_filename))
+
+            # Try a broader search by just filename
+            cursor.execute("""
+                SELECT ZDIRECTORY, ZFILENAME, ZORIGINALFILENAME
+                FROM ZASSET
+                WHERE ZFILENAME = ?
+            """, (disk_filename,))
+            broader = cursor.fetchall()
+            if broader:
+                print("  [Broader search by filename only found {} match(es):]".format(len(broader)))
+                for r in broader:
+                    print("    dir={}, file={}, original={}".format(r[0], r[1], r[2]))
+            else:
+                print("  [No match even by filename alone]")
+
+                # Try searching by directory
+                cursor.execute("""
+                    SELECT ZDIRECTORY, ZFILENAME, ZORIGINALFILENAME
+                    FROM ZASSET
+                    WHERE ZDIRECTORY = ?
+                """, (directory,))
+                dir_matches = cursor.fetchall()
+                if dir_matches:
+                    print("  [Files in same directory in DB:]")
+                    for r in dir_matches:
+                        print("    dir={}, file={}, original={}".format(r[0], r[1], r[2]))
+
+        conn.close()
+    except sqlite3.Error as e:
+        print("  [DB error: {}]".format(e))
+
+    print("=" * 60)
+    print()
+
+
+def copy_photos_by_year(media_files, destination, dry_run, test=False, library_path=None):
     # type: (List[Tuple[str, str, int]], str, bool, bool) -> None
     """Copy media files into per-year folders at the destination."""
     copied = 0
@@ -272,6 +387,8 @@ def copy_photos_by_year(media_files, destination, dry_run, test=False):
             copied += 1
             if test:
                 print("  [TEST] Successfully copied 1 file: {} -> {}".format(src_path, final_path))
+                if library_path:
+                    print_test_diagnostics(src_path, dest_filename, year, library_path)
                 break
             if i % 100 == 0 or i == total:
                 print("  Progress: {:,}/{:,} files processed...".format(i, total))
@@ -356,7 +473,7 @@ def main():
         print("Make sure the NAS is mounted (Finder > Go > Connect to Server).")
         sys.exit(1)
 
-    copy_photos_by_year(media_files, destination, args.dry_run, args.test)
+    copy_photos_by_year(media_files, destination, args.dry_run, args.test, source)
 
 
 if __name__ == "__main__":

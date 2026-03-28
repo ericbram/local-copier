@@ -16,6 +16,8 @@ NOTE: To access the macOS Photos Library, Terminal (or your IDE) needs
 Full Disk Access: System Settings > Privacy & Security > Full Disk Access
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import os
